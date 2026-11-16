@@ -39,6 +39,20 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 
+# Reuse the real fixtures from test_subagent_executor.py rather than
+# re-implementing its module-mocking dance (it breaks a genuine import cycle
+# between deerflow.subagents.__init__ and deerflow.agents via a conftest.py
+# sys.modules substitution that this fixture chain temporarily undoes).
+# These names are pytest fixtures: importing the already-decorated functions
+# makes them usable here exactly as in their home module.
+from test_subagent_executor import (  # noqa: F401
+    _setup_executor_classes,  # noqa: F401
+    base_config,
+    classes,
+    mock_agent,
+    msg,
+)
+
 # ---------------------------------------------------------------------------
 # 1. Empty final responses — TerminalResponseMiddleware (already handled)
 # ---------------------------------------------------------------------------
@@ -49,18 +63,9 @@ from deerflow.agents.middlewares.terminal_response_middleware import TerminalRes
 # ---------------------------------------------------------------------------
 # 4. Top-level recursion — worker.run_agent (fixed by this suite)
 # ---------------------------------------------------------------------------
-from deerflow.runtime import RunContext, RunManager, RunStatus, TOP_LEVEL_RECURSION_STOP_REASON
+from deerflow.runtime import TOP_LEVEL_RECURSION_STOP_REASON, RunContext, RunManager, RunStatus
 from deerflow.runtime.runs.store.memory import MemoryRunStore
 from deerflow.runtime.runs.worker import run_agent
-
-# Reuse the real fixtures from test_subagent_executor.py rather than
-# re-implementing its module-mocking dance (it breaks a genuine import cycle
-# between deerflow.subagents.__init__ and deerflow.agents via a conftest.py
-# sys.modules substitution that this fixture chain temporarily undoes).
-# These names are pytest fixtures: importing the already-decorated functions
-# makes them usable here exactly as in their home module.
-from test_subagent_executor import _setup_executor_classes  # noqa: F401
-from test_subagent_executor import base_config, classes, mock_agent, msg  # noqa: F401
 
 
 @tool

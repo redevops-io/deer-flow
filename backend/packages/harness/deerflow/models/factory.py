@@ -453,9 +453,7 @@ def warn_if_reasoning_continuity_at_risk(
     if not _history_carries_unreplayed_reasoning(messages):
         return False
     logger.warning(
-        "Thread %s: checkpointed history carries a prior turn's reasoning/reasoning_content, "
-        "but the model configured for this turn (%s, %s) does not preserve it across turns — "
-        "reasoning continuity will be lost on this turn.",
+        "Thread %s: checkpointed history carries a prior turn's reasoning/reasoning_content, but the model configured for this turn (%s, %s) does not preserve it across turns — reasoning continuity will be lost on this turn.",
         thread_id,
         model_name,
         model_class.__name__,
