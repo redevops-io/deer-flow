@@ -15,7 +15,12 @@ class UntrustedToolGateConfig(BaseModel):
 
     enabled: bool = Field(
         default=True,
-        description=("Whether to withhold write-capable tools once untrusted remote content (web fetch/search/browser results) has entered the thread's history. Default on, since this closes a real prompt-injection-to-side-effect gap. Disable only when write tools and untrusted input are already mutually exclusive by some other infrastructure control (e.g. a fully isolated single-purpose sandbox)."),
+        description=(
+            "Whether to withhold write-capable tools once untrusted remote content (web fetch/search/browser "
+            "results) has entered the thread's history. Default on, since this closes a real "
+            "prompt-injection-to-side-effect gap. Disable only when write tools and untrusted input are already "
+            "mutually exclusive by some other infrastructure control (e.g. a fully isolated single-purpose sandbox)."
+        ),
     )
     untrusted_source_groups: frozenset[str] = Field(
         default=frozenset({"web", "browser"}),
