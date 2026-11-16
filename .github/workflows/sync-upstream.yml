@@ -1,0 +1,109 @@
+name: Sync Upstream
+
+# Keeps this fork's two tracked branches (main, 2.1.x-dev - the branch
+# ReDevOps actually runs in production) aware of bytedance/deer-flow.
+#
+# Weekly, not daily: upstream is an active project but this fork's own
+# commits (the ReDevOps resilience fixes, PRs #1/#2) only land occasionally,
+# and a daily cron would mostly just be noise. Manual dispatch covers the
+# "I need this now" case (e.g. a security advisory lands upstream).
+#
+# Behavior per tracked branch:
+#   - If the fork's branch is a pure prefix of upstream's (no fork-local
+#     commits beyond the common ancestor - true for main today, and true
+#     for 2.1.x-dev until PRs #1/#2 merge): fast-forward it directly, no PR.
+#   - If the fork has diverged (fork-local commits exist, as 2.1.x-dev will
+#     once #1/#2 merge): never force-push or rewrite fork history. Instead
+#     open (or update) a PR from a sync/<branch>-<date> branch merging
+#     upstream's tip into the fork's branch, for human review per
+#     FORK_MAINTENANCE.md's release-promotion step. A merge conflict is
+#     reported in the PR body, not auto-resolved.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    if: github.repository == 'redevops-io/deer-flow'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [main, 2.1.x-dev]
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/bytedance/deer-flow.git
+
+      - name: Fetch upstream
+        run: git fetch upstream ${{ matrix.branch }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "redevops-fork-sync[bot]"
+          git config user.email "fork-sync@redevops.io"
+
+      - name: Fast-forward or open a sync PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_TIP=$(git rev-parse upstream/"$BRANCH")
+          FORK_TIP=$(git rev-parse HEAD)
+
+          if [ "$UPSTREAM_TIP" = "$FORK_TIP" ]; then
+            echo "Already in sync with upstream/$BRANCH ($UPSTREAM_TIP). Nothing to do."
+            exit 0
+          fi
+
+          MERGE_BASE=$(git merge-base HEAD upstream/"$BRANCH")
+
+          if [ "$MERGE_BASE" = "$FORK_TIP" ]; then
+            # Fork branch has no commits upstream lacks: safe fast-forward, no PR needed.
+            echo "Fast-forwarding $BRANCH to upstream tip $UPSTREAM_TIP"
+            git merge --ff-only upstream/"$BRANCH"
+            git push origin "$BRANCH"
+            exit 0
+          fi
+
+          # Fork has diverged (fork-local commits exist on this branch).
+          # Never rewrite fork history automatically - open a PR instead.
+          SYNC_BRANCH="sync/${BRANCH}-$(date -u +%Y%m%d)"
+          git checkout -b "$SYNC_BRANCH"
+
+          if git merge --no-edit upstream/"$BRANCH"; then
+            CONFLICT_NOTE=""
+          else
+            CONFLICT_NOTE="**This merge has conflicts.** Resolve them on \`$SYNC_BRANCH\` before merging; do not force-push over \`$BRANCH\`."
+            git merge --abort || true
+            git commit --allow-empty -m "sync: upstream/$BRANCH has diverging history - conflicts need manual resolution (see PR body)"
+          fi
+
+          git push -u origin "$SYNC_BRANCH"
+
+          EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --json number -q '.[0].number' || true)
+          if [ -z "$EXISTING_PR" ]; then
+            PR_BODY=$(printf 'Automated weekly upstream sync. Fork branch `%s` has ReDevOps-local commits beyond the common ancestor with `bytedance/deer-flow`, so this was opened as a PR for review rather than fast-forwarded. %s\n\nPer FORK_MAINTENANCE.md: review the upstream diff for anything affecting the two resilience fixes or any other fork-local change, run the fork'"'"'s CI, then merge.' "$BRANCH" "$CONFLICT_NOTE")
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "$BRANCH" \
+              --head "$SYNC_BRANCH" \
+              --title "sync: merge upstream/$BRANCH ($UPSTREAM_TIP) into $BRANCH" \
+              --body "$PR_BODY"
+          else
+            echo "PR #$EXISTING_PR already open for $SYNC_BRANCH"
+          fi
