@@ -16,14 +16,38 @@ embedded in fetched content cannot make a withheld tool schema reappear —
 unlike a warning, which such a prompt could simply instruct the model to
 ignore.
 
-Scope and a known limitation: detection scans ``state["messages"]`` for a
-qualifying ``ToolMessage``, so the gate is thread-durable only as long as that
-message stays in the visible window. If a future summarization pass compacts
-it out of history without leaving an equivalent durable marker, a later turn
-in the same thread could regain write-tool access. No such marker exists yet;
-adding one (mirroring ``DurableContextMiddleware``'s receipt-survives-
-summarization pattern) is a reasonable follow-up, not implemented here to
-keep this fix scoped to the gating mechanism itself.
+Scope and known limitations, confirmed by adversarial testing (see
+``test_untrusted_tool_gate_middleware.py`` and
+``test_untrusted_tool_gate_wiring.py``):
+
+- Detection scans ``state["messages"]`` for a qualifying ``ToolMessage``, so
+  the gate is thread-durable only as long as that message stays in the
+  visible window. If a future summarization pass compacts it out of history
+  without leaving an equivalent durable marker, a later turn in the same
+  thread could regain write-tool access. No such marker exists yet; adding
+  one (mirroring ``DurableContextMiddleware``'s receipt-survives-
+  summarization pattern) is a reasonable follow-up, not implemented here to
+  keep this fix scoped to the gating mechanism itself.
+- Coverage is a group-label allowlist, not a tool-capability inspection: a
+  tool is only withheld if its configured ``group`` (in config.yaml) appears
+  in ``write_tool_groups``. A new side-effecting tool (sends email, writes to
+  an external system, executes code under a different name) that is not
+  tagged into one of those groups is invisible to this gate and will NOT be
+  withheld, even after untrusted content has been seen. There is no
+  automatic way to detect "this tool has a side effect" from configuration
+  alone; operators must deliberately put every write/side-effecting tool
+  into a group listed in ``write_tool_groups`` for it to be covered.
+  ``_build_runtime_middlewares`` logs a warning if the configured groups
+  resolve to zero tools while tools exist, so a renamed/typo'd group is at
+  least visible, but a *wrongly* -tagged-but-still-resolving tool is not
+  detectable from config alone.
+- The check is scoped to the current thread's own message history. A fact
+  written to long-lived memory (DeerMem) while untrusted content was active
+  in one thread carries no provenance tag; if it resurfaces in a brand-new
+  thread that never itself called an untrusted-source tool, this gate would
+  not block write tools there even if that resurfaced fact originated from a
+  prompt-injection attempt. Closing this needs provenance tracking through
+  the memory write/read path, which is out of scope for this middleware.
 """
 
 from __future__ import annotations
