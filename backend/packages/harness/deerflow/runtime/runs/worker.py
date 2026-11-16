@@ -33,7 +33,9 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any, Final, Literal, cast
 
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Overwrite
 
 from deerflow.agents.goal_state import GoalEvaluation, GoalState
@@ -97,6 +99,15 @@ from .naming import resolve_root_run_name
 from .schemas import RunStatus
 
 logger = logging.getLogger(__name__)
+
+# Stamped as the run's stop_reason when the top-level (lead-agent) graph
+# exhausts the Gateway's recursion_limit (see
+# ``app/gateway/services.py::_resolve_gateway_recursion_limits``) and
+# ``agent.astream(...)`` raises ``GraphRecursionError``. Mirrors
+# ``SubagentExecutor``'s own ``"turn_capped"`` recovery
+# (``deerflow.subagents.executor``) one layer up: the top-level run exhausted
+# its turn/recursion budget exactly the way a subagent exhausts ``max_turns``.
+TOP_LEVEL_RECURSION_STOP_REASON = "turn_capped"
 
 _checkpoint_locks = AsyncKeyedLockTable[str]()
 
@@ -851,6 +862,10 @@ async def run_agent(
     workspace_excluded_dir_names: frozenset[str] | None = None
     snapshot_capture_failed = False
     llm_error_fallback_message: str | None = None
+    # Last root-graph stream_mode="values" snapshot seen so far this run. Used
+    # only to recover a usable partial result if agent.astream(...) raises
+    # GraphRecursionError — see the except clause below.
+    last_values_state: dict[str, Any] | None = None
     checkpoint_rollback_completed = False
     # Message ids checkpointed *before* this run started. The stream loop uses
     # this set to mask out ``deerflow_error_fallback`` markers that belong to
@@ -1212,12 +1227,32 @@ async def run_agent(
         # _resolve_model_name in agent.py may return the default model if the
         # requested name is not in the allowlist — this update ensures the
         # persisted model_name reflects the actual model used.
-        if record.model_name is not None:
-            resolved = getattr(agent, "metadata", {}) or {}
-            if isinstance(resolved, dict):
-                effective = resolved.get("model_name")
-                if effective and effective != record.model_name:
-                    await run_manager.update_model_name(record.run_id, effective)
+        agent_metadata = getattr(agent, "metadata", {}) or {}
+        effective_model_name = agent_metadata.get("model_name") if isinstance(agent_metadata, dict) else None
+        if record.model_name is not None and effective_model_name and effective_model_name != record.model_name:
+            await run_manager.update_model_name(record.run_id, effective_model_name)
+
+        # If this thread's prior checkpointed history carries a turn's
+        # reasoning/reasoning_content (produced by a reasoning-preserving
+        # provider such as VllmChatModel) and the model resolved for *this*
+        # turn does not preserve it across turns, warn the operator rather
+        # than letting the drop pass silently. Durable cross-model-version
+        # reasoning-state migration is a separate, larger effort ("model
+        # succession") and intentionally out of scope here.
+        if rollback_point is not None:
+            resolved_model_name = effective_model_name or record.model_name
+            if resolved_model_name is not None:
+                try:
+                    from deerflow.models.factory import warn_if_reasoning_continuity_at_risk
+
+                    warn_if_reasoning_continuity_at_risk(
+                        resolved_model_name,
+                        rollback_point.messages,
+                        app_config=ctx.app_config,
+                        thread_id=thread_id,
+                    )
+                except Exception:
+                    logger.debug("Reasoning-continuity check failed for run %s (non-fatal)", run_id, exc_info=True)
 
         # 4. Attach checkpointer and store
         if checkpointer is not None:
@@ -1252,7 +1287,7 @@ async def run_agent(
         seq_stamper = _build_seq_stamper(event_store, thread_id, journal) if "values" in requested_modes else None
 
         async def _stream_once(input_payload: Any, stream_config: RunnableConfig) -> None:
-            nonlocal llm_error_fallback_message
+            nonlocal llm_error_fallback_message, last_values_state
             file_tool_chunk_batcher = _LargeFileToolChunkBatcher() if "messages-tuple" in requested_modes else None
             try:
                 async with _checkpoint_thread_lock(thread_id):
@@ -1271,6 +1306,10 @@ async def run_agent(
                                     # Custom frames carry task_* events whose payload can hold a delegated
                                     # subagent's messages; see the multi-mode branch below.
                                     llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk, pre_existing_message_ids)
+                                if single_mode == "values":
+                                    # Kept so a GraphRecursionError raised by the next
+                                    # astream iteration can recover a partial result.
+                                    last_values_state = chunk
                                 sse_event = _lg_mode_to_sse_event(single_mode)
                                 single_payload = serialize(chunk, mode=single_mode)
                                 if single_mode == "values" and seq_stamper is not None:
@@ -1317,6 +1356,10 @@ async def run_agent(
                                 # includes the child messages task_running custom events
                                 # carry, which are root frames too.
                                 llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk, pre_existing_message_ids)
+                                if mode == "values":
+                                    # Kept so a GraphRecursionError raised by the next
+                                    # astream iteration can recover a partial result.
+                                    last_values_state = chunk
                             await _publish_stream_item(
                                 bridge=bridge,
                                 run_id=run_id,
@@ -1436,6 +1479,50 @@ async def run_agent(
 
     except asyncio.CancelledError:
         await _finish_cancellation(record.abort_action)
+
+    except GraphRecursionError as exc:
+        # The Gateway's recursion_limit (_resolve_gateway_recursion_limits in
+        # app/gateway/services.py) was exhausted mid-stream. Unlike a bare
+        # failure, recover whatever usable assistant text the last "values"
+        # snapshot produced before the limit tripped — mirroring the recovery
+        # SubagentExecutor performs one layer down when a subagent exhausts
+        # its own max_turns — instead of reporting this as an
+        # undifferentiated generic error with no stop_reason.
+        usable_partial = _extract_recursion_partial_result(last_values_state, pre_existing_message_ids)
+        error_msg = f"Recursion limit exhausted before producing a final response: {exc}"
+        logger.warning(
+            "Run %s: recursion limit exhausted (GraphRecursionError); %s",
+            run_id,
+            "recovering partial result" if usable_partial is not None else "no usable partial result to recover",
+            exc_info=True,
+        )
+        await _ensure_finalizing_before_edit_failure(run_manager, record)
+        if usable_partial is not None:
+            cancel_action = await run_manager.set_status_if_not_cancelled(
+                run_id,
+                RunStatus.success,
+                stop_reason=TOP_LEVEL_RECURSION_STOP_REASON,
+                **terminal_status_kwargs,
+            )
+        else:
+            cancel_action = await run_manager.set_status_if_not_cancelled(
+                run_id,
+                RunStatus.error,
+                error=error_msg,
+                stop_reason=TOP_LEVEL_RECURSION_STOP_REASON,
+                **terminal_status_kwargs,
+            )
+        if cancel_action is not None:
+            await _finish_cancellation(cancel_action)
+        elif usable_partial is None:
+            await bridge.publish(
+                run_id,
+                "error",
+                {
+                    "message": error_msg,
+                    "name": type(exc).__name__,
+                },
+            )
 
     except Exception as exc:
         error_msg = f"{exc}"
@@ -2802,6 +2889,32 @@ def _try_extract_from_message(obj: Any, pre_existing_ids: set[str] | None = None
         nested_kwargs = obj.get("additional_kwargs")
         if isinstance(nested_kwargs, dict) and nested_kwargs.get("deerflow_error_fallback"):
             return _error_fallback_message_from_metadata(nested_kwargs, obj.get("content"))
+    return None
+
+
+def _extract_recursion_partial_result(value: Any, pre_existing_ids: set[str] | None = None) -> str | None:
+    """Recover the last usable assistant text from a "values" state snapshot.
+
+    Mirrors ``SubagentExecutor``'s own ``GraphRecursionError`` recovery
+    (``deerflow.subagents.executor``): scan the messages channel of the last
+    ``stream_mode="values"`` chunk this run produced before
+    ``recursion_limit`` tripped, and return the most recent ``AIMessage``'s
+    text if there is one. Messages whose id appears in ``pre_existing_ids``
+    belong to a prior run on this thread (replayed into every "values"
+    chunk) and are never mistaken for this run's own partial work.
+    """
+    if not isinstance(value, dict):
+        return None
+    messages = value.get("messages")
+    if not isinstance(messages, (list, tuple)):
+        return None
+    for msg in reversed(messages):
+        msg_id = _message_id(msg)
+        if pre_existing_ids and msg_id is not None and msg_id in pre_existing_ids:
+            return None
+        if isinstance(msg, AIMessage):
+            text = message_to_text(msg).strip()
+            return text or None
     return None
 
 
