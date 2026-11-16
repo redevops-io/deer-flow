@@ -70,7 +70,9 @@ jobs:
   fullstack-replay-render:
     name: Layer 2 — full-stack render (no API key)
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    # Pinned (not ubuntu-latest): Playwright 1.59.1's browser-dependency installer
+    # doesn't yet support the ubuntu-latest image once it moves past 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
