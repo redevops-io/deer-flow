@@ -247,6 +247,27 @@ def _build_runtime_middlewares(
         write_tool_names = frozenset(t.name for t in app_config.tools if t.group in untrusted_gate_config.write_tool_groups)
         if untrusted_source_names and write_tool_names:
             tail.append(UntrustedContentToolGateMiddleware(untrusted_source_names, write_tool_names))
+        elif app_config.tools:
+            # Resolution is group-label matching against configured tools, not
+            # tool-level metadata: a renamed/typo'd group in either list (or a
+            # write-capable tool that was never tagged into write_tool_groups
+            # in the first place) silently drops the mitigation with no
+            # tool added at all — enabled: true then protects nothing, and
+            # nothing before this said so. Warn loudly so a misconfiguration
+            # is visible instead of indistinguishable from "no write tools
+            # exist" (the only case this is actually safe to skip silently).
+            logger.warning(
+                "untrusted_tool_gate.enabled is true but resolved %d untrusted-source tool(s) and %d write tool(s) "
+                "from the configured groups %s / %s against %d configured tools — the lethal-trifecta mitigation is "
+                "NOT ACTIVE for this run. Check tool_groups and each tool's `group` field in config.yaml: a tool "
+                "capable of a write/side-effecting action is only covered if its `group` is listed in "
+                "write_tool_groups.",
+                len(untrusted_source_names),
+                len(write_tool_names),
+                sorted(untrusted_gate_config.untrusted_source_groups),
+                sorted(untrusted_gate_config.write_tool_groups),
+                len(app_config.tools),
+            )
 
     # Authorization uses the existing GuardrailMiddleware so execution-time
     # deny, audit, and fail-closed handling stay in one proven implementation.
