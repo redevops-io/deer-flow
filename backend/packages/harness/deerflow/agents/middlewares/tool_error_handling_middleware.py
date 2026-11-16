@@ -231,6 +231,23 @@ def _build_runtime_middlewares(
 
         tail.append(ToolReceiptMiddleware(render_mode=receipts_render_mode))
 
+    # Lethal-trifecta mitigation: once untrusted remote content (a result from
+    # an "untrusted_source_groups" tool, default web/browser) is anywhere in
+    # the thread, withhold write-capable tools (default bash/file:write) from
+    # model binding, and reject any write-tool call that still comes through,
+    # for the rest of the run. Placed after ToolReceiptMiddleware (like the
+    # other short-circuiters below) so a blocked call still gets a receipt
+    # rather than silently gapping the ledger; registered as a short-circuiter
+    # in deerflow.extensions.ordering for the same reason.
+    untrusted_gate_config = app_config.untrusted_tool_gate
+    if untrusted_gate_config.enabled:
+        from deerflow.agents.middlewares.untrusted_tool_gate_middleware import UntrustedContentToolGateMiddleware
+
+        untrusted_source_names = frozenset(t.name for t in app_config.tools if t.group in untrusted_gate_config.untrusted_source_groups)
+        write_tool_names = frozenset(t.name for t in app_config.tools if t.group in untrusted_gate_config.write_tool_groups)
+        if untrusted_source_names and write_tool_names:
+            tail.append(UntrustedContentToolGateMiddleware(untrusted_source_names, write_tool_names))
+
     # Authorization uses the existing GuardrailMiddleware so execution-time
     # deny, audit, and fail-closed handling stay in one proven implementation.
     # It is appended before an explicit guardrail provider, making authorization
