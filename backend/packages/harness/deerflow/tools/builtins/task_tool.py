@@ -803,15 +803,24 @@ async def task_tool(
     # content verbatim as serialized text. Compute contamination once, from
     # the parent's real messages, and seed it into the child's initial state.
     parent_untrusted_content_seen = False
-    if runtime is not None and runtime_app_config is not None:
+    if runtime is not None:
         from deerflow.agents.middlewares.untrusted_tool_gate_middleware import (
+            UNTRUSTED_CONTENT_STATE_KEY,
             resolve_untrusted_source_names,
             scan_messages_for_untrusted_result,
         )
 
-        parent_untrusted_content_seen = scan_messages_for_untrusted_result(
-            runtime.state.get("messages"),
-            resolve_untrusted_source_names(runtime_app_config),
+        # Check the already-seeded flag first: *this* agent may itself be a
+        # subagent that inherited it from an earlier delegation hop, with no
+        # ToolMessage of its own in a fresh message list for a live scan to
+        # find -- nested delegation (a subagent delegating further) must not
+        # silently drop contamination at the second hop.
+        parent_untrusted_content_seen = bool(runtime.state.get(UNTRUSTED_CONTENT_STATE_KEY)) or (
+            runtime_app_config is not None
+            and scan_messages_for_untrusted_result(
+                runtime.state.get("messages"),
+                resolve_untrusted_source_names(runtime_app_config),
+            )
         )
 
     # Build config overrides

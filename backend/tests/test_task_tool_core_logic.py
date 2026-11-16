@@ -787,6 +787,108 @@ def test_task_tool_threads_runtime_app_config_to_subagent_dependencies(monkeypat
     assert captured["bash_gate_app_config"] is app_config
     assert captured["tools_kwargs"]["app_config"] is app_config
     assert captured["executor_kwargs"]["app_config"] is app_config
+
+
+def test_task_tool_propagates_untrusted_content_flag_through_nested_delegation(monkeypatch):
+    """Security regression (lethal-trifecta mitigation, nested-delegation
+    edge case): a subagent that itself was dispatched with
+    untrusted_content_seen=True in its state (inherited from an earlier
+    delegation hop) has no ToolMessage of its own for a live message scan to
+    find if it delegates further -- the dispatch site must also check the
+    already-seeded state flag, not just scan messages, or a second hop of
+    delegation silently drops the contamination."""
+    from deerflow.agents.middlewares.untrusted_tool_gate_middleware import UNTRUSTED_CONTENT_STATE_KEY
+
+    app_config = SimpleNamespace(
+        untrusted_tool_gate=SimpleNamespace(enabled=True, untrusted_source_groups=frozenset({"web"})),
+        tools=[SimpleNamespace(name="web_fetch", group="web")],
+    )
+    config = _make_subagent_config(name="general-purpose")
+    runtime = SimpleNamespace(
+        state={UNTRUSTED_CONTENT_STATE_KEY: True, "messages": []},
+        context={"thread_id": "thread-nested", "app_config": app_config},
+        config={"metadata": {"model_name": "ark-model", "trace_id": "trace-nested"}},
+    )
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            captured["executor_kwargs"] = kwargs
+
+        def execute_async(self, prompt, task_id=None):
+            return task_id or "generated-task-id"
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "get_available_subagent_names", lambda *, app_config: ["general-purpose"])
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda name, *, app_config: config)
+    monkeypatch.setattr(task_tool_module, "is_host_bash_allowed", lambda config: True)
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: [].append)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+
+    _run_task_tool(
+        runtime=runtime,
+        description="delegate further",
+        prompt="do a sub-sub-task",
+        subagent_type="general-purpose",
+        tool_call_id="tc-nested",
+    )
+
+    assert captured["executor_kwargs"].get("parent_untrusted_content_seen") is True
+
+
+def test_task_tool_does_not_propagate_flag_for_a_clean_nested_delegation(monkeypatch):
+    """Counterpart to the above: a genuinely clean subagent (no flag, no
+    untrusted ToolMessage) must not contaminate every further delegation --
+    the check must not be a false-positive trap either."""
+    app_config = SimpleNamespace(
+        untrusted_tool_gate=SimpleNamespace(enabled=True, untrusted_source_groups=frozenset({"web"})),
+        tools=[SimpleNamespace(name="web_fetch", group="web")],
+    )
+    config = _make_subagent_config(name="general-purpose")
+    runtime = SimpleNamespace(
+        state={"messages": []},
+        context={"thread_id": "thread-clean", "app_config": app_config},
+        config={"metadata": {"model_name": "ark-model", "trace_id": "trace-clean"}},
+    )
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            captured["executor_kwargs"] = kwargs
+
+        def execute_async(self, prompt, task_id=None):
+            return task_id or "generated-task-id"
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "get_available_subagent_names", lambda *, app_config: ["general-purpose"])
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda name, *, app_config: config)
+    monkeypatch.setattr(task_tool_module, "is_host_bash_allowed", lambda config: True)
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: [].append)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+
+    _run_task_tool(
+        runtime=runtime,
+        description="delegate further",
+        prompt="do a sub-sub-task",
+        subagent_type="general-purpose",
+        tool_call_id="tc-clean",
+    )
+
+    assert "parent_untrusted_content_seen" not in captured["executor_kwargs"]
     assert captured["executor_kwargs"]["tools"] == ["tool-a"]
 
 
