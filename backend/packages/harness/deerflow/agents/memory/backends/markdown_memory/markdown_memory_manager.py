@@ -41,9 +41,7 @@ from deerflow.agents.memory.manager import MemoryManager
 
 from .config import MarkdownMemoryConfig
 
-_FACT_LINE_RE = re.compile(
-    r"^- fact-(?P<id>[0-9a-f]{12}) \[(?P<category>[^\]]*)\] \(confidence=(?P<confidence>[0-9.]+)\) (?P<created>\S+) :: (?P<content>.*)$"
-)
+_FACT_LINE_RE = re.compile(r"^- fact-(?P<id>[0-9a-f]{12}) \[(?P<category>[^\]]*)\] \(confidence=(?P<confidence>[0-9.]+)\) (?P<created>\S+) :: (?P<content>.*)$")
 
 _FACTS_HEADER = (
     "# Memory facts\n\n"
