@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import threading
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,6 +21,12 @@ from deerflow.agents.memory.backends.deermem.deermem.core.updater import (
 )
 from deerflow.agents.memory.manager import LangfuseMemoryCallbacks
 from deerflow.trace_context import get_current_trace_id, request_trace_context
+
+
+def _iso_days_ago(days: float) -> str:
+    """Relative-to-now fixture timestamp; see test_deermem_self_contained.py's
+    copy of this helper for why a fixed calendar date is unsafe here."""
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
 
 
 def _make_memory(facts: list[dict[str, object]] | None = None) -> dict[str, object]:
@@ -274,7 +281,7 @@ def test_automatic_update_uses_hybrid_capacity_policy() -> None:
                     "content": f"high {index}",
                     "category": "preference",
                     "confidence": 0.99,
-                    "createdAt": "2026-08-12T00:00:00Z",
+                    "createdAt": _iso_days_ago(1),
                 }
                 for index in range(8)
             ],
@@ -283,15 +290,15 @@ def test_automatic_update_uses_hybrid_capacity_policy() -> None:
                 "content": "stale high confidence",
                 "category": "preference",
                 "confidence": 0.9,
-                "createdAt": "2025-01-01T00:00:00Z",
+                "createdAt": _iso_days_ago(400),
             },
             {
                 "id": "confirmed_recently",
                 "content": "recently confirmed preference",
                 "category": "preference",
                 "confidence": 0.7,
-                "createdAt": "2025-01-01T00:00:00Z",
-                "lastConfirmedAt": "2026-08-12T00:00:00Z",
+                "createdAt": _iso_days_ago(400),
+                "lastConfirmedAt": _iso_days_ago(1),
             },
         ]
     )
