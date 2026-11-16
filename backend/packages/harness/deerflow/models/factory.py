@@ -1,6 +1,10 @@
+import importlib
 import logging
+from collections.abc import Sequence
+from typing import Any
 
 from langchain.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
 from langchain_openai.chat_models.base import BaseChatOpenAI
 
 from deerflow.config import get_app_config
@@ -9,6 +13,10 @@ from deerflow.reflection import resolve_class
 from deerflow.tracing import build_tracing_callbacks
 
 logger = logging.getLogger(__name__)
+
+#: Fields a reasoning-preserving provider (``VllmChatModel`` and its siblings
+#: below) stores a prior turn's chain-of-thought under, in ``AIMessage.additional_kwargs``.
+_REASONING_CONTINUITY_FIELDS: tuple[str, ...] = ("reasoning", "reasoning_content")
 
 
 def _deep_merge_dicts(base: dict | None, override: dict) -> dict:
@@ -358,4 +366,98 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
             existing_callbacks = model_instance.callbacks or []
             model_instance.callbacks = [*existing_callbacks, *callbacks]
             logger.debug(f"Tracing attached to model '{name}' with providers={len(callbacks)}")
+
     return model_instance
+
+
+def _reasoning_continuity_capable_classes() -> tuple[type, ...]:
+    """Provider classes that re-inject a prior turn's reasoning onto the
+    outgoing request, the same multi-turn continuity ``VllmChatModel``
+    implements for vLLM/Qwen's interleaved-thinking parser.
+
+    Lazily imported (and best-effort) so a provider module that fails to
+    import for an unrelated reason never breaks this detection — it would
+    just be treated as "not known to preserve continuity", which is the
+    conservative (warn) outcome anyway.
+    """
+    classes: list[type] = []
+    for module_name, class_name in (
+        ("deerflow.models.vllm_provider", "VllmChatModel"),
+        ("deerflow.models.patched_deepseek", "PatchedChatDeepSeek"),
+        ("deerflow.models.patched_stepfun", "PatchedChatStepFun"),
+        ("deerflow.models.patched_minimax", "PatchedChatMiniMax"),
+        ("deerflow.models.patched_mimo", "PatchedChatMiMo"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            classes.append(getattr(module, class_name))
+        except Exception:
+            logger.debug("Could not import reasoning-continuity provider class %s.%s", module_name, class_name, exc_info=True)
+    return tuple(classes)
+
+
+def _history_carries_unreplayed_reasoning(messages: Sequence[Any]) -> bool:
+    """Whether *messages* contains an assistant turn carrying ``reasoning``/
+    ``reasoning_content`` — i.e. it was produced by a reasoning-preserving
+    provider on a prior turn of this same checkpointed thread."""
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        if isinstance(additional_kwargs, dict) and any(additional_kwargs.get(field) for field in _REASONING_CONTINUITY_FIELDS):
+            return True
+    return False
+
+
+def warn_if_reasoning_continuity_at_risk(
+    model_name: str,
+    messages: Sequence[Any],
+    *,
+    app_config: AppConfig | None = None,
+    thread_id: str | None = None,
+) -> bool:
+    """Log an operator-visible warning when switching *model_name* mid-thread
+    would silently drop a prior turn's reasoning continuity.
+
+    ``VllmChatModel`` (and the sibling provider patches resolved by
+    :func:`_reasoning_continuity_capable_classes`) override
+    ``_get_request_payload`` to re-inject a prior turn's
+    ``reasoning``/``reasoning_content`` onto the outgoing request so
+    vLLM/Qwen's interleaved-thinking parser sees the assistant's own prior
+    chain-of-thought on the next turn. That override is private to those
+    classes: if an operator reconfigures a checkpointed thread to a
+    different model/provider between turns, the prior turn's reasoning is
+    silently absent from the outgoing request on this turn — no exception,
+    no warning, just absence.
+
+    This is detection only: it never raises and never mutates *messages*.
+    Durable cross-model-version reasoning-state migration between arbitrary
+    provider classes is a separate, larger effort (tracked alongside a
+    "model succession" workstream) and intentionally out of scope here —
+    this only stops the drop from being silent.
+
+    Returns True when the warning fired (mainly useful for tests).
+    """
+    config = app_config or get_app_config()
+    model_config = config.get_model_config(model_name)
+    if model_config is None:
+        return False
+    try:
+        model_class = resolve_class(model_config.use, BaseChatModel)
+    except Exception:
+        logger.debug("Could not resolve model class for %s while checking reasoning continuity", model_name, exc_info=True)
+        return False
+    capable_classes = _reasoning_continuity_capable_classes()
+    if capable_classes and issubclass(model_class, capable_classes):
+        return False
+    if not _history_carries_unreplayed_reasoning(messages):
+        return False
+    logger.warning(
+        "Thread %s: checkpointed history carries a prior turn's reasoning/reasoning_content, "
+        "but the model configured for this turn (%s, %s) does not preserve it across turns — "
+        "reasoning continuity will be lost on this turn.",
+        thread_id,
+        model_name,
+        model_class.__name__,
+    )
+    return True
