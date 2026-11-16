@@ -798,6 +798,7 @@ class SubagentExecutor:
         tool_promotion_recorder: Any | None = None,
         tool_progress_recorder: Any | None = None,
         context_snapshot: ParentContextSnapshot | None = None,
+        parent_untrusted_content_seen: bool = False,
     ):
         """Initialize the executor.
 
@@ -852,6 +853,13 @@ class SubagentExecutor:
             context_snapshot: Optional immutable parent history captured by the
                 ordinary task tool at dispatch. Rendered as background data,
                 never as child execution evidence or inherited system authority.
+            parent_untrusted_content_seen: Whether the parent thread's own
+                messages already contained a result from an untrusted-source
+                tool at dispatch time (lethal-trifecta mitigation). Seeded into
+                the child's initial state so UntrustedContentToolGateMiddleware
+                withholds write-capable tools for this child too, since the
+                child's own fresh message list carries no ToolMessage the
+                gate's live scan would otherwise see.
         """
         self.config = config
         self.app_config = app_config
@@ -868,6 +876,7 @@ class SubagentExecutor:
         self.thread_data = thread_data
         self.uploaded_files = deepcopy(uploaded_files) if uploaded_files is not None else None
         self.context_snapshot = context_snapshot
+        self.parent_untrusted_content_seen = parent_untrusted_content_seen
         self.thread_id = thread_id
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
@@ -1330,6 +1339,10 @@ class SubagentExecutor:
         state: dict[str, Any] = {
             "messages": messages,
         }
+        if self.parent_untrusted_content_seen:
+            from deerflow.agents.middlewares.untrusted_tool_gate_middleware import UNTRUSTED_CONTENT_STATE_KEY
+
+            state[UNTRUSTED_CONTENT_STATE_KEY] = True
 
         # Pass through the parent runtime state that tools need. Each child
         # receives fresh containers so graph writes never mutate the snapshot

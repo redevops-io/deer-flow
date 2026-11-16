@@ -30,6 +30,7 @@ import pytest
 from packaging.version import Version
 
 from deerflow.agents.middlewares.tool_receipt_middleware import ToolReceiptMiddleware
+from deerflow.agents.middlewares.untrusted_tool_gate_middleware import UNTRUSTED_CONTENT_STATE_KEY
 from deerflow.sandbox.lease import SandboxLeaseManager
 from deerflow.skills.types import Skill
 from deerflow.subagents.capacity import SubagentCapacityRejected
@@ -645,6 +646,70 @@ class TestAgentConstruction:
         assert isinstance(messages[0], SystemMessage)
         assert base_config.system_prompt in messages[0].content
         assert isinstance(messages[1], HumanMessage)
+
+    @pytest.mark.anyio
+    async def test_build_initial_state_seeds_untrusted_content_flag_when_parent_contaminated(
+        self,
+        classes,
+        base_config,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Lethal-trifecta mitigation across the delegation boundary (security
+        regression for the fork's adversarial PR #8 follow-up): a subagent's
+        own initial state carries no ToolMessage from the parent thread (only
+        a fresh system prompt, an optional serialized context-snapshot
+        HumanMessage, and the task HumanMessage), so UntrustedContentToolGateMiddleware's
+        live message scan alone would never see contamination the parent
+        already picked up. parent_untrusted_content_seen=True must seed the
+        explicit state flag so the child's own gate still withholds write
+        tools."""
+        SubagentExecutor = classes["SubagentExecutor"]
+
+        monkeypatch.setattr(
+            sys.modules["deerflow.skills.storage"],
+            "get_or_new_user_skill_storage",
+            lambda user_id, *, app_config=None: SimpleNamespace(load_skills=lambda *, enabled_only: []),
+        )
+
+        executor = SubagentExecutor(
+            config=base_config,
+            tools=[],
+            thread_id="test-thread",
+            parent_untrusted_content_seen=True,
+        )
+
+        state, _final_tools, _deferred_setup = await executor._build_initial_state("Do the task")
+
+        assert state.get(UNTRUSTED_CONTENT_STATE_KEY) is True
+        # And no ToolMessage exists in the fresh message list for a live scan
+        # to find on its own -- the flag is load-bearing, not redundant.
+        from langchain_core.messages import ToolMessage
+
+        assert not any(isinstance(m, ToolMessage) for m in state["messages"])
+
+    @pytest.mark.anyio
+    async def test_build_initial_state_omits_untrusted_content_flag_by_default(
+        self,
+        classes,
+        base_config,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A clean parent thread (the default) must not contaminate every
+        delegated subagent -- the flag is opt-in per dispatch, not sticky
+        process-wide."""
+        SubagentExecutor = classes["SubagentExecutor"]
+
+        monkeypatch.setattr(
+            sys.modules["deerflow.skills.storage"],
+            "get_or_new_user_skill_storage",
+            lambda user_id, *, app_config=None: SimpleNamespace(load_skills=lambda *, enabled_only: []),
+        )
+
+        executor = SubagentExecutor(config=base_config, tools=[], thread_id="test-thread")
+
+        state, _final_tools, _deferred_setup = await executor._build_initial_state("Do the task")
+
+        assert UNTRUSTED_CONTENT_STATE_KEY not in state
 
     @pytest.mark.anyio
     async def test_build_initial_state_inherits_background_without_execution_evidence(self, classes, base_config):
