@@ -48,6 +48,20 @@ Scope and known limitations, confirmed by adversarial testing (see
   not block write tools there even if that resurfaced fact originated from a
   prompt-injection attempt. Closing this needs provenance tracking through
   the memory write/read path, which is out of scope for this middleware.
+
+Delegation boundary, found and closed (not a remaining limitation): a
+subagent's initial state is built fresh (a new system prompt, an optional
+serialized ``ParentContextSnapshot`` HumanMessage, and the task HumanMessage)
+-- it carries no ``ToolMessage`` instances from the parent thread, so a
+message-only scan would never see contamination the parent already picked
+up, even though the snapshot's serialized text can carry the very same
+untrusted content verbatim. Proved with an adversarial test, then closed:
+``UNTRUSTED_CONTENT_STATE_KEY`` lets the task-tool dispatch site compute
+contamination once from the parent state (via
+:func:`scan_messages_for_untrusted_result`, checking both the parent's own
+live messages and, for a subagent delegating further, a flag it may have
+inherited from an earlier hop) and seed it into the child's initial state, so
+the gate also checks this explicit flag, not just a live message scan.
 """
 
 from __future__ import annotations
@@ -64,6 +78,39 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
+
+# State key a subagent's initial state can carry so dispatch-time contamination
+# (computed from the parent's own message history) survives the delegation
+# boundary even though the child's own message list starts fresh.
+UNTRUSTED_CONTENT_STATE_KEY = "untrusted_content_seen"
+
+
+def resolve_untrusted_source_names(app_config: object) -> frozenset[str]:
+    """Tool names (not groups) whose results count as untrusted external content.
+
+    Defensive about *app_config*'s shape on purpose: callers may legitimately
+    pass a context-var sentinel or partial stand-in rather than a real,
+    fully-populated ``AppConfig`` (e.g. dispatch-time threading through test
+    doubles). Resolution failure here must never crash delegation -- it can
+    only fall back to not seeding the contamination flag, the same gap that
+    existed before this helper did anything at all.
+    """
+    gate_config = getattr(app_config, "untrusted_tool_gate", None)
+    if gate_config is None or not getattr(gate_config, "enabled", False):
+        return frozenset()
+    tools = getattr(app_config, "tools", None) or []
+    source_groups = getattr(gate_config, "untrusted_source_groups", None) or frozenset()
+    return frozenset(t.name for t in tools if getattr(t, "group", None) in source_groups)
+
+
+def scan_messages_for_untrusted_result(messages: object, untrusted_source_names: frozenset[str]) -> bool:
+    """True if any message in *messages* is a ``ToolMessage`` from an untrusted-source tool."""
+    if not untrusted_source_names:
+        return False
+    for message in messages or []:
+        if isinstance(message, ToolMessage) and str(getattr(message, "name", "") or "") in untrusted_source_names:
+            return True
+    return False
 
 
 class UntrustedContentToolGateMiddleware(AgentMiddleware[AgentState]):
@@ -87,8 +134,10 @@ class UntrustedContentToolGateMiddleware(AgentMiddleware[AgentState]):
         return str(getattr(message, "name", "") or "") in self._untrusted_source_names
 
     def _untrusted_content_seen(self, state: object) -> bool:
-        messages = (state or {}).get("messages") or []
-        return any(self._is_untrusted_result(m) for m in messages)
+        state = state or {}
+        if state.get(UNTRUSTED_CONTENT_STATE_KEY):
+            return True
+        return scan_messages_for_untrusted_result(state.get("messages"), self._untrusted_source_names)
 
     def _filter_tools(self, request: ModelRequest) -> ModelRequest:
         if not self._write_tool_names or not self._untrusted_content_seen(request.state):

@@ -795,6 +795,25 @@ async def task_tool(
     # after delegation validation, before child setup (including tool loading).
     context_snapshot = ParentContextSnapshot.from_state(runtime.state) if context_mode == "snapshot" and runtime is not None else None
 
+    # Lethal-trifecta mitigation, delegation boundary: a subagent's own initial
+    # state carries no ToolMessage instances (see context_snapshot's docstring
+    # and UntrustedContentToolGateMiddleware's), so a parent thread that has
+    # already seen untrusted content would otherwise hand a clean slate to the
+    # child's own gate check even though the snapshot can carry that same
+    # content verbatim as serialized text. Compute contamination once, from
+    # the parent's real messages, and seed it into the child's initial state.
+    parent_untrusted_content_seen = False
+    if runtime is not None and runtime_app_config is not None:
+        from deerflow.agents.middlewares.untrusted_tool_gate_middleware import (
+            resolve_untrusted_source_names,
+            scan_messages_for_untrusted_result,
+        )
+
+        parent_untrusted_content_seen = scan_messages_for_untrusted_result(
+            runtime.state.get("messages"),
+            resolve_untrusted_source_names(runtime_app_config),
+        )
+
     # Build config overrides
     overrides: dict = {}
 
@@ -932,6 +951,8 @@ async def task_tool(
     }
     if context_snapshot is not None:
         executor_kwargs["context_snapshot"] = context_snapshot
+    if parent_untrusted_content_seen:
+        executor_kwargs["parent_untrusted_content_seen"] = True
     middleware_recorder = None
     parent_journal = parent_context.get("__run_journal")
     if parent_journal is not None:
