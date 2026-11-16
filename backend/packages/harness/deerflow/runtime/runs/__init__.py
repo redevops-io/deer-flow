@@ -2,7 +2,7 @@
 
 from .manager import ORPHAN_RECOVERY_STOP_REASON, STARTUP_ORPHAN_RECOVERY_ERROR, CancelOutcome, ConflictError, RunManager, RunRecord, UnsupportedStrategyError
 from .schemas import DisconnectMode, RunStatus, ThreadOperationKind
-from .worker import RunContext, run_agent
+from .worker import TOP_LEVEL_RECURSION_STOP_REASON, RunContext, run_agent
 
 __all__ = [
     "CancelOutcome",
@@ -15,6 +15,7 @@ __all__ = [
     "RunStatus",
     "ThreadOperationKind",
     "STARTUP_ORPHAN_RECOVERY_ERROR",
+    "TOP_LEVEL_RECURSION_STOP_REASON",
     "UnsupportedStrategyError",
     "run_agent",
 ]
