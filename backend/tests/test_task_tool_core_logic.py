@@ -787,6 +787,7 @@ def test_task_tool_threads_runtime_app_config_to_subagent_dependencies(monkeypat
     assert captured["bash_gate_app_config"] is app_config
     assert captured["tools_kwargs"]["app_config"] is app_config
     assert captured["executor_kwargs"]["app_config"] is app_config
+    assert captured["executor_kwargs"]["tools"] == ["tool-a"]
 
 
 def test_task_tool_propagates_untrusted_content_flag_through_nested_delegation(monkeypatch):
@@ -889,7 +890,6 @@ def test_task_tool_does_not_propagate_flag_for_a_clean_nested_delegation(monkeyp
     )
 
     assert "parent_untrusted_content_seen" not in captured["executor_kwargs"]
-    assert captured["executor_kwargs"]["tools"] == ["tool-a"]
 
 
 def test_task_tool_emits_running_and_completed_events(monkeypatch):
